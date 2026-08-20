@@ -1,0 +1,115 @@
+# ------------------------------------------------------------------
+# safety.yaml — smoke / CO emergency response
+# Integrations: Kidde HomeSafe, HomeKit Controller, UniFi Protect,
+#               Z-Wave JS (safety binary_sensors), Cast (TTS)
+# ------------------------------------------------------------------
+
+# One group to rule all smoke/CO detectors so automations stay simple.
+# TODO: replace members with your real Kidde / HomeKit / UniFi Protect sensors.
+binary_sensor:
+  - platform: group
+    name: "Smoke or CO detected"
+    device_class: smoke
+    entities:
+      - binary_sensor.kidde_hallway_smoke
+      - binary_sensor.kidde_hallway_carbon_monoxide
+      - binary_sensor.kidde_basement_smoke
+      - binary_sensor.homekit_kitchen_smoke
+      - binary_sensor.homekit_kitchen_carbon_monoxide
+      - binary_sensor.unifiprotect_garage_smoke_co
+
+script:
+  emergency_lights_on:
+    alias: "Emergency: all lights on full"
+    icon: mdi:alarm-light
+    sequence:
+      - action: light.turn_on
+        target:
+          entity_id: all
+        data:
+          brightness_pct: 100
+
+automation:
+  - alias: "Safety: smoke or CO emergency response"
+    id: safety_smoke_co_response
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.smoke_or_co_detected
+        to: "on"
+    actions:
+      # 1. Wake the house — lights on everywhere, media off.
+      - action: script.emergency_lights_on
+      - action: media_player.turn_off
+        target:
+          entity_id: all
+      # 2. Notify every phone with a critical push (bypasses Do Not Disturb on iOS/Android).
+      - action: notify.notify
+        data:
+          title: "🚨 SMOKE / CO ALARM"
+          message: >
+            Alarm triggered by: {{ expand('binary_sensor.smoke_or_co_detected')
+              | selectattr('state', 'eq', 'on') | map(attribute='name') | join(', ') }}
+          data:
+            push:
+              sound:
+                name: default
+                critical: 1
+                volume: 1.0
+            ttl: 0
+            priority: high
+      # 3. Announce over every Cast speaker at full volume.
+      - action: media_player.volume_set
+        target:
+          entity_id: media_player.all_speakers   # TODO: your Cast speaker group
+        data:
+          volume_level: 1.0
+      - action: tts.speak
+        target:
+          entity_id: tts.google_translate_en_com  # TODO: your TTS entity
+        data:
+          media_player_entity_id: media_player.all_speakers
+          message: "Warning. Smoke or carbon monoxide has been detected. Please evacuate."
+      # 4. Open Z-Wave locks so nobody fumbles with keys on the way out.
+      #    Comment out if you'd rather not auto-unlock.
+      - action: lock.unlock
+        target:
+          entity_id:
+            - lock.front_door       # TODO: your Z-Wave JS locks
+            - lock.back_door
+
+  - alias: "Safety: all-clear notification"
+    id: safety_smoke_co_all_clear
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.smoke_or_co_detected
+        to: "off"
+        for: "00:02:00"
+    actions:
+      - action: notify.notify
+        data:
+          title: "✅ Smoke/CO all clear"
+          message: "All smoke and CO detectors have returned to normal."
+
+  # Kidde and Z-Wave devices report a generic `problem` class when something
+  # is wrong (sensor fault, end-of-life). Surface it instead of finding out later.
+  - alias: "Safety: detector fault or offline"
+    id: safety_detector_problem
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id:
+          - binary_sensor.kidde_hallway_problem       # TODO: your problem sensors
+          - binary_sensor.kidde_basement_problem
+        to: "on"
+        for: "00:05:00"
+      - trigger: state
+        entity_id: binary_sensor.kidde_bridge_connectivity  # TODO: Kidde connectivity sensor
+        to: "off"
+        for: "00:30:00"
+    actions:
+      - action: notify.notify
+        data:
+          title: "⚠️ Safety device problem"
+          message: "{{ trigger.to_state.name }} is reporting a fault or has gone offline."

@@ -1,0 +1,100 @@
+# ------------------------------------------------------------------
+# energy.yaml — power alerts and solar-aware usage
+# Integrations: Emporia Vue, SolarEdge, Forecast Solar, Powercalc, Shelly
+# ------------------------------------------------------------------
+
+template:
+  - sensor:
+      # Net grid draw = house load minus solar production.
+      # TODO: replace both source sensors.
+      - name: "Net grid power"
+        unit_of_measurement: "W"
+        device_class: power
+        state_class: measurement
+        state: >
+          {{ (states('sensor.emporia_vue_mains_power') | float(0))
+             - (states('sensor.solaredge_current_power') | float(0)) }}
+
+  - binary_sensor:
+      # "Free electricity" window: solar producing more than the house uses.
+      - name: "Solar surplus"
+        state: >
+          {{ (states('sensor.solaredge_current_power') | float(0))
+             > (states('sensor.emporia_vue_mains_power') | float(0)) + 300 }}
+        delay_on: "00:10:00"
+        delay_off: "00:10:00"
+
+automation:
+  - alias: "Energy: unusually high power draw"
+    id: energy_high_draw
+    mode: single
+    triggers:
+      - trigger: numeric_state
+        entity_id: sensor.emporia_vue_mains_power     # TODO: whole-home power
+        above: input_number.power_alert_threshold
+        for: "00:10:00"
+    actions:
+      - action: notify.notify
+        data:
+          title: "⚡ High power draw"
+          message: >
+            Whole-home draw has been above
+            {{ states('input_number.power_alert_threshold') | int }} W for 10 minutes
+            (now {{ states('sensor.emporia_vue_mains_power') }} W).
+            Check the oven, dryer, or space heaters.
+
+  - alias: "Energy: solar surplus — good time to run appliances"
+    id: energy_solar_surplus
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.solar_surplus
+        to: "on"
+    conditions:
+      # Only during the day, only once per day.
+      - condition: sun
+        after: sunrise
+        before: sunset
+      - condition: template
+        value_template: >
+          {{ state_attr(this.entity_id, 'last_triggered') is none or
+             state_attr(this.entity_id, 'last_triggered').date() != now().date() }}
+    actions:
+      - action: notify.notify
+        data:
+          title: "☀️ Solar surplus"
+          message: >
+            Panels are producing more than the house is using — good time for
+            laundry, dishwasher, or EV charging.
+
+  - alias: "Energy: evening report"
+    id: energy_evening_report
+    mode: single
+    triggers:
+      - trigger: time
+        at: "21:00:00"
+    actions:
+      - action: notify.notify
+        data:
+          title: "📊 Energy today"
+          message: >
+            Used {{ states('sensor.daily_energy') }} kWh ·
+            Solar produced {{ states('sensor.daily_solar') }} kWh ·
+            Forecast for tomorrow:
+            {{ states('sensor.energy_production_tomorrow') }} kWh
+
+  # A Shelly reporting a problem usually means an overheating or overpowered relay.
+  - alias: "Energy: Shelly device problem"
+    id: energy_shelly_problem
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id:
+          - binary_sensor.shelly_1_overheating       # TODO: your Shelly problem sensors
+          - binary_sensor.shelly_2_overpowering
+        to: "on"
+    actions:
+      - action: notify.notify
+        data:
+          title: "⚠️ Shelly problem"
+          message: "{{ trigger.to_state.name }} is reporting a fault. Check the device."

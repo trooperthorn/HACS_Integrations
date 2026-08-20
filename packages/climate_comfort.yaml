@@ -1,0 +1,91 @@
+# ------------------------------------------------------------------
+# climate_comfort.yaml — sun/weather-driven curtains and shades
+# Integrations: SwitchBot (curtain), Z-Wave JS (shade), WeatherFlow
+#               (illuminance, temperature), Sun
+# ------------------------------------------------------------------
+
+automation:
+  - alias: "Comfort: open curtains after sunrise"
+    id: comfort_open_curtains_morning
+    mode: single
+    triggers:
+      - trigger: sun
+        event: sunrise
+        offset: "00:30:00"
+    conditions:
+      - condition: state
+        entity_id: input_boolean.quiet_hours
+        state: "off"    # don't fling curtains open if the goodnight latch is still on
+      - condition: state
+        entity_id: input_boolean.vacation_mode
+        state: "off"
+    actions:
+      - action: cover.open_cover
+        target:
+          entity_id:
+            - cover.switchbot_living_room_curtain   # TODO: SwitchBot curtains
+            - cover.zwave_office_shade              # TODO: Z-Wave shades
+
+  # Hot afternoon sun + bright light: drop shades to keep the house cool.
+  - alias: "Comfort: close shades against afternoon sun"
+    id: comfort_heat_shades
+    mode: single
+    triggers:
+      - trigger: numeric_state
+        entity_id: sensor.weatherflow_illuminance     # TODO: WeatherFlow illuminance
+        above: 40000
+        for: "00:15:00"
+    conditions:
+      - condition: numeric_state
+        entity_id: sensor.weatherflow_air_temperature # TODO: outdoor temp
+        above: 80
+      - condition: time
+        after: "12:00:00"
+        before: "18:00:00"
+    actions:
+      - action: cover.set_cover_position
+        target:
+          entity_id: cover.zwave_office_shade
+        data:
+          position: 20
+      - action: cover.close_cover
+        target:
+          entity_id: cover.switchbot_living_room_curtain
+
+  - alias: "Comfort: close curtains at sunset"
+    id: comfort_close_at_sunset
+    mode: single
+    triggers:
+      - trigger: sun
+        event: sunset
+        offset: "00:15:00"
+    actions:
+      - action: cover.close_cover
+        target:
+          entity_id:
+            - cover.switchbot_living_room_curtain
+            - cover.zwave_office_shade
+
+  # Vacation-mode presence simulation using the same covers + lights,
+  # keyed off real sunset so it never looks robotic.
+  - alias: "Comfort: vacation presence simulation"
+    id: comfort_vacation_sim
+    mode: single
+    triggers:
+      - trigger: sun
+        event: sunset
+        offset: "-00:20:00"
+    conditions:
+      - condition: state
+        entity_id: input_boolean.vacation_mode
+        state: "on"
+    actions:
+      - action: light.turn_on
+        target:
+          entity_id: light.living_room              # TODO: a visible-from-street light
+      - delay:
+          hours: 3
+          minutes: "{{ range(0, 45) | random }}"
+      - action: light.turn_off
+        target:
+          entity_id: light.living_room

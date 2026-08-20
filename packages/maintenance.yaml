@@ -1,0 +1,151 @@
+# ------------------------------------------------------------------
+# maintenance.yaml — the boring stuff that keeps everything else working
+# Integrations: Backup, Google Drive, System Monitor, Uptime Kuma,
+#               Mobile App, ESPHome/Shelly/UniFi/Phyn/Z-Wave JS (update
+#               entities), Govee BLE / SwitchBot / Mopeka (batteries),
+#               Cloud, Hassio
+# ------------------------------------------------------------------
+
+automation:
+  # Weekly digest of every battery below the threshold, one message,
+  # Saturday morning — instead of 14 separate nag alerts.
+  - alias: "Maintenance: weekly low-battery digest"
+    id: maint_battery_digest
+    mode: single
+    triggers:
+      - trigger: time
+        at: "09:00:00"
+    conditions:
+      - condition: time
+        weekday: [sat]
+      - condition: template
+        value_template: >
+          {{ states.sensor
+             | selectattr('attributes.device_class', 'eq', 'battery')
+             | map(attribute='state') | select('is_number') | map('float')
+             | select('<', states('input_number.battery_low_threshold') | float(20))
+             | list | count > 0 }}
+    actions:
+      - action: notify.notify
+        data:
+          title: "🔋 Batteries needing attention"
+          message: >
+            {% set threshold = states('input_number.battery_low_threshold') | float(20) %}
+            {% for s in states.sensor
+               | selectattr('attributes.device_class', 'eq', 'battery')
+               | sort(attribute='state') %}
+            {% if s.state is is_number and s.state | float < threshold %}
+            • {{ s.name }}: {{ s.state }}%
+            {% endif %}
+            {% endfor %}
+
+  # Backup integration exposes last-successful-backup timestamp. If it's
+  # stale, the safety net is gone — say so loudly.
+  - alias: "Maintenance: backup is stale"
+    id: maint_backup_stale
+    mode: single
+    triggers:
+      - trigger: time
+        at: "10:00:00"
+    conditions:
+      - condition: template
+        value_template: >
+          {{ (now() - states('sensor.backup_last_successful_automatic_backup')
+              | as_datetime | as_local).days > 2 }}
+    actions:
+      - action: notify.notify
+        data:
+          title: "🗄️ Backups are stale"
+          message: >
+            Last successful backup:
+            {{ states('sensor.backup_last_successful_automatic_backup') }}.
+            Google Drive usage: {{ states('sensor.google_drive_size') }}.
+
+  - alias: "Maintenance: server disk almost full"
+    id: maint_disk_full
+    mode: single
+    triggers:
+      - trigger: numeric_state
+        entity_id: sensor.system_monitor_disk_use_percent   # TODO: System Monitor disk %
+        above: 85
+        for: "01:00:00"
+    actions:
+      - action: notify.notify
+        data:
+          title: "💽 HA server disk at {{ states('sensor.system_monitor_disk_use_percent') }}%"
+          message: "Prune old backups, camera recordings, or the database recorder."
+
+  # One firmware digest per week instead of a badge you never look at.
+  # update.* entities from ESPHome, Shelly, UniFi, Phyn, and Z-Wave JS all count.
+  - alias: "Maintenance: weekly firmware update digest"
+    id: maint_update_digest
+    mode: single
+    triggers:
+      - trigger: time
+        at: "09:15:00"
+    conditions:
+      - condition: time
+        weekday: [sat]
+      - condition: template
+        value_template: >
+          {{ states.update | selectattr('state', 'eq', 'on') | list | count > 0 }}
+    actions:
+      - action: notify.notify
+        data:
+          title: "⬆️ Firmware updates available"
+          message: >
+            {% for u in states.update | selectattr('state', 'eq', 'on') %}
+            • {{ u.name }}
+            {% endfor %}
+
+  # Uptime Kuma watches your services; bounce that straight to your phone.
+  - alias: "Maintenance: monitored service down"
+    id: maint_service_down
+    mode: single
+    max_exceeded: silent
+    triggers:
+      - trigger: state
+        entity_id:
+          - sensor.uptime_kuma_status          # TODO: your Uptime Kuma monitor sensors
+        to: "down"
+        for: "00:03:00"
+    actions:
+      - action: notify.notify
+        data:
+          title: "🔻 Service down"
+          message: "{{ trigger.to_state.name }} has been down for 3 minutes."
+
+  # Nabu Casa cloud link lost — remote access and Alexa/Google will be out.
+  - alias: "Maintenance: cloud connection lost"
+    id: maint_cloud_down
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.cloud_remote_ui
+        to: "off"
+        for: "00:15:00"
+    actions:
+      - action: notify.notify
+        data:
+          title: "☁️ Home Assistant Cloud offline"
+          message: "Remote access has been down for 15 minutes."
+
+  # Phone about to die while you're out — charge it before you're unreachable.
+  - alias: "Maintenance: phone battery low while away"
+    id: maint_phone_battery
+    mode: single
+    triggers:
+      - trigger: numeric_state
+        entity_id: sensor.your_phone_battery_level    # TODO: Mobile App battery sensor
+        below: 25
+    conditions:
+      - condition: state
+        entity_id: person.you                          # TODO: your person entity
+        state: "not_home"
+      - condition: state
+        entity_id: binary_sensor.your_phone_is_charging  # TODO: Mobile App plug sensor
+        state: "off"
+    actions:
+      - action: notify.notify
+        data:
+          message: "🪫 Your phone is at {{ states('sensor.your_phone_battery_level') }}% — plug in soon."

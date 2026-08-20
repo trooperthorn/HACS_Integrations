@@ -1,0 +1,48 @@
+# ------------------------------------------------------------------
+# commute.yaml — Waze-aware departure alerts
+# Integrations: Waze Travel Time, Mobile App
+# Uses the input_datetime.workday_departure helper from helpers.yaml.
+# ------------------------------------------------------------------
+
+automation:
+  # 45 minutes before your usual departure, check Waze. If the drive is
+  # meaningfully slower than normal, tell you to leave early.
+  - alias: "Commute: traffic check before departure"
+    id: commute_traffic_check
+    mode: single
+    triggers:
+      - trigger: template
+        value_template: >
+          {{ (now().hour * 60 + now().minute) ==
+             (state_attr('input_datetime.workday_departure', 'hour') | int(8) * 60
+              + state_attr('input_datetime.workday_departure', 'minute') | int(0)
+              - 45) }}
+    conditions:
+      - condition: time
+        weekday: [mon, tue, wed, thu, fri]
+      - condition: state
+        entity_id: person.you                    # TODO: your person entity
+        state: "home"
+      - condition: state
+        entity_id: input_boolean.vacation_mode
+        state: "off"
+    actions:
+      - variables:
+          commute: "{{ states('sensor.waze_travel_time_to_work') | float(0) }}"  # TODO: Waze sensor
+          typical: 30    # TODO: your normal commute in minutes
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: "{{ commute > typical * 1.3 }}"
+            sequence:
+              - action: notify.notify
+                data:
+                  title: "🚗 Traffic is heavy"
+                  message: >
+                    Drive to work is {{ commute | round(0) }} min
+                    (normally ~{{ typical }}). Leave
+                    {{ ((commute - typical)) | round(0) }} min early.
+        default:
+          - action: notify.notify
+            data:
+              message: "🚗 Commute looks normal: {{ commute | round(0) }} min."

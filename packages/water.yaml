@@ -1,0 +1,114 @@
+# ------------------------------------------------------------------
+# water.yaml — leak response, freeze protection, propane monitoring
+# Integrations: Phyn (valve + sensors), Davis Vantage (moisture),
+#               Mopeka (propane tank), WeatherFlow (temperature)
+# ------------------------------------------------------------------
+
+automation:
+  - alias: "Water: leak detected — shut off main and alert"
+    id: water_leak_shutoff
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id:
+          - binary_sensor.phyn_water_leak            # TODO: Phyn problem/leak sensor
+          - binary_sensor.davis_vantage_moisture     # TODO: Davis moisture sensor
+        to: "on"
+    actions:
+      - action: valve.close_valve
+        target:
+          entity_id: valve.phyn_main_water           # TODO: your Phyn shutoff valve
+      - action: notify.notify
+        data:
+          title: "💧 WATER LEAK — main shut off"
+          message: >
+            {{ trigger.to_state.name }} detected water. The Phyn main valve has
+            been closed automatically.
+          data:
+            push:
+              sound:
+                name: default
+                critical: 1
+                volume: 1.0
+            priority: high
+
+  # Phyn tracks continuous flow; running water for a long time with nobody
+  # home usually means a stuck toilet or a forgotten hose.
+  - alias: "Water: long-running flow while away"
+    id: water_long_flow_away
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.phyn_water_running   # TODO: Phyn 'running' sensor
+        to: "on"
+        for: "00:20:00"
+    conditions:
+      - condition: state
+        entity_id: zone.home
+        state: "0"     # nobody home
+    actions:
+      - action: notify.notify
+        data:
+          title: "💧 Water running while away"
+          message: >
+            Water has been running for 20+ minutes and nobody is home.
+          data:
+            actions:
+              - action: "CLOSE_WATER_VALVE"
+                title: "Shut off water"
+
+  - alias: "Water: actionable notification — close valve"
+    id: water_close_valve_action
+    mode: single
+    triggers:
+      - trigger: event
+        event_type: mobile_app_notification_action
+        event_data:
+          action: "CLOSE_WATER_VALVE"
+    actions:
+      - action: valve.close_valve
+        target:
+          entity_id: valve.phyn_main_water
+      - action: notify.notify
+        data:
+          message: "✅ Main water valve closed."
+
+  # Outdoor temperature below freezing + water pressure data from Phyn:
+  # remind about hose bibs and get ahead of burst pipes.
+  - alias: "Water: freeze warning"
+    id: water_freeze_warning
+    mode: single
+    triggers:
+      - trigger: numeric_state
+        entity_id: sensor.weatherflow_air_temperature   # TODO: WeatherFlow outdoor temp
+        below: 28
+        for: "00:30:00"
+    conditions:
+      # Only alert once per cold snap: last alert more than 12 h ago.
+      - condition: template
+        value_template: >
+          {{ (now() - state_attr(this.entity_id, 'last_triggered')
+              | default(as_datetime('2000-01-01'), true)).total_seconds() > 43200 }}
+    actions:
+      - action: notify.notify
+        data:
+          title: "🥶 Freeze warning"
+          message: >
+            Outdoor temperature is {{ states('sensor.weatherflow_air_temperature') }}°.
+            Check hose bibs and exposed pipes.
+
+  - alias: "Propane: tank level low"
+    id: propane_tank_low
+    mode: single
+    triggers:
+      - trigger: numeric_state
+        entity_id: sensor.mopeka_tank_level             # TODO: Mopeka tank level %
+        below: input_number.propane_low_threshold
+        for: "01:00:00"
+    actions:
+      - action: notify.notify
+        data:
+          title: "🔥 Propane low"
+          message: >
+            Propane tank is at {{ states('sensor.mopeka_tank_level') }}% —
+            time to schedule a refill.

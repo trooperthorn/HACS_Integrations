@@ -1,0 +1,237 @@
+# ------------------------------------------------------------------
+# presence_security.yaml — bed-presence goodnight, open-door alerts,
+# welcome home, away lockdown
+# Integrations: SleepIQ / Sleep Number Pro, Z-Wave JS (locks, sensors),
+#               ESPHome (garage cover), Group (door/window groups),
+#               Keymaster, Mobile App, Proximity, SwitchBot
+# ------------------------------------------------------------------
+
+script:
+  goodnight:
+    alias: "Goodnight"
+    icon: mdi:weather-night
+    sequence:
+      - action: light.turn_off
+        target:
+          entity_id: all
+      - action: media_player.turn_off
+        target:
+          entity_id: all
+      - action: lock.lock
+        target:
+          entity_id:
+            - lock.front_door          # TODO: your Z-Wave JS locks
+            - lock.back_door
+      - action: cover.close_cover
+        target:
+          entity_id:
+            - cover.switchbot_living_room_curtain   # TODO: SwitchBot curtains
+            - cover.bedroom_shade                   # TODO: Z-Wave shades
+      # Close the garage only if it's open.
+      - if:
+          - condition: state
+            entity_id: cover.esphome_garage_door    # TODO: ESPHome garage cover
+            state: "open"
+        then:
+          - action: cover.close_cover
+            target:
+              entity_id: cover.esphome_garage_door
+      - action: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.quiet_hours
+
+  leaving_home:
+    alias: "Leaving home"
+    icon: mdi:home-export-outline
+    sequence:
+      - action: light.turn_off
+        target:
+          entity_id: all
+      - action: media_player.turn_off
+        target:
+          entity_id: all
+      - action: lock.lock
+        target:
+          entity_id:
+            - lock.front_door
+            - lock.back_door
+
+automation:
+  # SleepIQ/Sleep Number bed presence is the most reliable "actually asleep"
+  # signal there is. Everyone in bed after 21:30 → run goodnight, once a night.
+  - alias: "Presence: everyone in bed — goodnight"
+    id: presence_everyone_in_bed
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id:
+          - binary_sensor.sleepiq_bed_left_occupied    # TODO: your bed occupancy sensors
+          - binary_sensor.sleepiq_bed_right_occupied
+        to: "on"
+        for: "00:10:00"
+    conditions:
+      - condition: time
+        after: "21:30:00"
+        before: "04:00:00"
+      - condition: state
+        entity_id:
+          - binary_sensor.sleepiq_bed_left_occupied
+          - binary_sensor.sleepiq_bed_right_occupied
+        state: "on"
+      - condition: state
+        entity_id: input_boolean.goodnight_ran_tonight
+        state: "off"
+      - condition: state
+        entity_id: input_boolean.guest_mode
+        state: "off"
+    actions:
+      - action: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.goodnight_ran_tonight
+      - action: script.goodnight
+
+  - alias: "Presence: reset nightly latch and quiet hours"
+    id: presence_reset_goodnight_latch
+    mode: single
+    triggers:
+      - trigger: time
+        at: "10:00:00"
+    actions:
+      - action: input_boolean.turn_off
+        target:
+          entity_id:
+            - input_boolean.goodnight_ran_tonight
+            - input_boolean.quiet_hours
+
+  # Your Group integration already provides door/window groups — use them.
+  - alias: "Security: door or window open at bedtime check"
+    id: security_open_at_night
+    mode: single
+    triggers:
+      - trigger: time
+        at: "22:00:00"
+    conditions:
+      - condition: or
+        conditions:
+          - condition: state
+            entity_id: binary_sensor.all_doors        # TODO: your Group door group
+            state: "on"
+          - condition: state
+            entity_id: binary_sensor.all_windows      # TODO: your Group window group
+            state: "on"
+    actions:
+      - action: notify.notify
+        data:
+          title: "🚪 Still open at 10 PM"
+          message: >
+            Open right now:
+            {{ (expand('binary_sensor.all_doors') + expand('binary_sensor.all_windows'))
+               | selectattr('state', 'eq', 'on') | map(attribute='name') | join(', ') }}
+
+  - alias: "Security: garage left open"
+    id: security_garage_left_open
+    mode: restart
+    triggers:
+      - trigger: state
+        entity_id: cover.esphome_garage_door
+        to: "open"
+        for: "00:30:00"
+    actions:
+      - action: notify.notify
+        data:
+          title: "🚗 Garage open 30 min"
+          message: "The garage door has been open for 30 minutes."
+          data:
+            actions:
+              - action: "CLOSE_GARAGE"
+                title: "Close it"
+
+  - alias: "Security: actionable notification — close garage"
+    id: security_close_garage_action
+    mode: single
+    triggers:
+      - trigger: event
+        event_type: mobile_app_notification_action
+        event_data:
+          action: "CLOSE_GARAGE"
+    actions:
+      - action: cover.close_cover
+        target:
+          entity_id: cover.esphome_garage_door
+      - action: notify.notify
+        data:
+          message: "✅ Garage closing."
+
+  # Proximity-based arrival: warm up the house before the car hits the driveway.
+  - alias: "Presence: welcome home"
+    id: presence_welcome_home
+    mode: single
+    triggers:
+      - trigger: numeric_state
+        entity_id: sensor.home_nearest_distance     # TODO: your Proximity sensor
+        below: 1                                    # km/miles per your config
+    conditions:
+      - condition: state
+        entity_id: sensor.home_nearest_direction_of_travel   # TODO: Proximity direction
+        state: "towards"
+      - condition: sun
+        after: sunset
+    actions:
+      - action: light.turn_on
+        target:
+          entity_id: light.entryway               # TODO: entry lights
+      - action: lock.unlock
+        target:
+          entity_id: lock.front_door
+
+  - alias: "Presence: last person leaves — lock down"
+    id: presence_lockdown_on_leave
+    mode: single
+    triggers:
+      - trigger: numeric_state
+        entity_id: zone.home
+        below: 1
+        for: "00:05:00"
+    conditions:
+      - condition: state
+        entity_id: input_boolean.guest_mode
+        state: "off"
+    actions:
+      - action: script.leaving_home
+      - if:
+          - condition: state
+            entity_id: cover.esphome_garage_door
+            state: "open"
+        then:
+          - action: notify.notify
+            data:
+              title: "🚗 Garage still open"
+              message: "Everyone left but the garage is open."
+              data:
+                actions:
+                  - action: "CLOSE_GARAGE"
+                    title: "Close it"
+
+  # UniFi Protect motion while nobody is home (and not from a known cause).
+  - alias: "Security: motion while away"
+    id: security_motion_while_away
+    mode: single
+    max_exceeded: silent
+    triggers:
+      - trigger: state
+        entity_id:
+          - binary_sensor.unifiprotect_front_motion    # TODO: UniFi Protect motion sensors
+          - binary_sensor.unifiprotect_back_motion
+        to: "on"
+    conditions:
+      - condition: state
+        entity_id: zone.home
+        state: "0"
+    actions:
+      - action: notify.notify
+        data:
+          title: "👀 Motion while away"
+          message: "{{ trigger.to_state.name }} detected motion."
+          data:
+            # Attach a camera snapshot on iOS/Android companion apps.
+            entity_id: camera.unifiprotect_front       # TODO: matching camera entity

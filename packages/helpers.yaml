@@ -1,0 +1,111 @@
+# ------------------------------------------------------------------
+# helpers.yaml — shared modes, tunable thresholds, and utility meters
+# Everything here is referenced by the other packages.
+# ------------------------------------------------------------------
+
+input_boolean:
+  guest_mode:
+    name: Guest mode
+    icon: mdi:account-group
+    # When on: skip auto-lock / auto-lights-off style automations.
+
+  vacation_mode:
+    name: Vacation mode
+    icon: mdi:beach
+    # When on: enable presence simulation, tighten security alerts.
+
+  quiet_hours:
+    name: Quiet hours
+    icon: mdi:sleep
+    # Suppresses TTS announcements and non-critical notifications.
+
+  goodnight_ran_tonight:
+    name: Goodnight routine ran tonight
+    icon: mdi:weather-night
+    # Latch so the everyone-in-bed automation fires only once per night.
+
+input_number:
+  co2_alert_threshold:
+    name: CO2 alert threshold
+    min: 600
+    max: 2000
+    step: 50
+    initial: 1000
+    unit_of_measurement: ppm
+    icon: mdi:molecule-co2
+
+  radon_alert_threshold:
+    name: Radon alert threshold
+    min: 1
+    max: 8
+    step: 0.5
+    initial: 4      # EPA action level, pCi/L
+    unit_of_measurement: pCi/L
+    icon: mdi:radioactive
+
+  power_alert_threshold:
+    name: Whole-home power alert threshold
+    min: 2000
+    max: 20000
+    step: 500
+    initial: 8000
+    unit_of_measurement: W
+    icon: mdi:flash-alert
+
+  battery_low_threshold:
+    name: Low battery threshold
+    min: 5
+    max: 40
+    step: 5
+    initial: 20
+    unit_of_measurement: "%"
+    icon: mdi:battery-alert
+
+  propane_low_threshold:
+    name: Propane low threshold
+    min: 5
+    max: 50
+    step: 5
+    initial: 20
+    unit_of_measurement: "%"
+    icon: mdi:propane-tank
+
+input_datetime:
+  workday_departure:
+    name: Workday departure time
+    has_date: false
+    has_time: true
+    initial: "08:00:00"
+
+# Group all low-battery-capable devices' battery sensors for the digest.
+# TODO: extend with every battery sensor you care about
+# (Govee BLE, SwitchBot, Mopeka, Z-Wave JS, HomeKit, WeatherFlow, Kidde, Phyn...).
+template:
+  - sensor:
+      - name: "Lowest battery"
+        unit_of_measurement: "%"
+        state_class: measurement
+        device_class: battery
+        state: >
+          {{ states.sensor
+             | selectattr('attributes.device_class', 'eq', 'battery')
+             | map(attribute='state')
+             | select('is_number')
+             | map('float')
+             | min | default(100) | round(0) }}
+
+# Daily / monthly energy tracking from the Emporia Vue mains sensor.
+# TODO: replace with your actual whole-home energy sensor.
+utility_meter:
+  daily_energy:
+    source: sensor.emporia_vue_mains_energy
+    name: Daily energy
+    cycle: daily
+  monthly_energy:
+    source: sensor.emporia_vue_mains_energy
+    name: Monthly energy
+    cycle: monthly
+  daily_solar:
+    source: sensor.solaredge_energy_today   # TODO: your SolarEdge lifetime/today energy sensor
+    name: Daily solar production
+    cycle: daily

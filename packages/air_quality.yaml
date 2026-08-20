@@ -1,0 +1,97 @@
+# ------------------------------------------------------------------
+# air_quality.yaml — Airthings radon / CO2 / VOC monitoring
+# Integrations: Airthings, Cast (announcements), Mobile App
+# Hysteresis: alerts fire above the threshold and reset 10–15% below it,
+# so a value hovering at the line doesn't spam you.
+# ------------------------------------------------------------------
+
+automation:
+  - alias: "Air: CO2 high — ventilate"
+    id: air_co2_high
+    mode: single
+    triggers:
+      - trigger: numeric_state
+        entity_id: sensor.airthings_co2               # TODO: Airthings CO2 sensor
+        above: input_number.co2_alert_threshold
+        for: "00:10:00"
+    actions:
+      - action: notify.notify
+        data:
+          title: "🌫️ CO2 is high"
+          message: >
+            CO2 is {{ states('sensor.airthings_co2') }} ppm
+            (threshold {{ states('input_number.co2_alert_threshold') | int }} ppm).
+            Consider opening a window or running the HRV/fan.
+      # If you have a ventilation fan on an Emporia Vue outlet, kick it on:
+      # - action: switch.turn_on
+      #   target:
+      #     entity_id: switch.emporia_vue_ventilation_fan   # TODO
+      # Wait for recovery (below 85% of threshold), then confirm.
+      - wait_for_trigger:
+          - trigger: template
+            value_template: >
+              {{ states('sensor.airthings_co2') | float(0) <
+                 states('input_number.co2_alert_threshold') | float * 0.85 }}
+        timeout: "04:00:00"
+      - if:
+          - condition: template
+            value_template: "{{ wait.completed }}"
+        then:
+          - action: notify.notify
+            data:
+              message: "✅ CO2 back to {{ states('sensor.airthings_co2') }} ppm."
+
+  - alias: "Air: radon above action level"
+    id: air_radon_high
+    mode: single
+    triggers:
+      - trigger: numeric_state
+        entity_id: sensor.airthings_radon             # TODO: Airthings radon (24h avg)
+        above: input_number.radon_alert_threshold
+        for: "06:00:00"    # radon is a long-term average; don't alert on blips
+    actions:
+      - action: notify.notify
+        data:
+          title: "☢️ Radon above action level"
+          message: >
+            24-hour radon average is {{ states('sensor.airthings_radon') }} pCi/L
+            (action level {{ states('input_number.radon_alert_threshold') }}).
+            Ventilate the lowest level and keep watching the weekly trend.
+
+  - alias: "Air: VOC spike"
+    id: air_voc_spike
+    mode: single
+    triggers:
+      - trigger: numeric_state
+        entity_id: sensor.airthings_voc               # TODO: Airthings VOC sensor
+        above: 2000
+        for: "00:15:00"
+    actions:
+      - action: notify.notify
+        data:
+          title: "🧪 VOC levels elevated"
+          message: >
+            VOC is {{ states('sensor.airthings_voc') }} ppb. New paint, cleaning
+            products, or cooking? Ventilate the room.
+
+  # A once-a-day pulse so air quality stays visible without opening dashboards.
+  - alias: "Air: morning air quality summary"
+    id: air_daily_summary
+    mode: single
+    triggers:
+      - trigger: time
+        at: "08:30:00"
+    conditions:
+      - condition: state
+        entity_id: input_boolean.vacation_mode
+        state: "off"
+    actions:
+      - action: notify.notify
+        data:
+          title: "🌬️ Air quality this morning"
+          message: >
+            Radon {{ states('sensor.airthings_radon') }} pCi/L ·
+            CO2 {{ states('sensor.airthings_co2') }} ppm ·
+            VOC {{ states('sensor.airthings_voc') }} ppb ·
+            PM2.5 {{ states('sensor.airthings_pm25') }} µg/m³ ·
+            Humidity {{ states('sensor.airthings_humidity') }}%
