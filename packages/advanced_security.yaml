@@ -1,0 +1,289 @@
+# ------------------------------------------------------------------
+# advanced_security.yaml — uncommon security patterns
+# Integrations: Z-Wave JS (lock notification events), Keymaster,
+#               Elk M1, SleepIQ / Sleep Number, UniFi Protect,
+#               WeatherFlow (lightning distance), Moon, Bermuda,
+#               Emporia Vue, Cast, Mobile App
+# ------------------------------------------------------------------
+
+automation:
+  # -------------------- WHO unlocked the door --------------------
+  # Z-Wave locks fire zwave_js_notification events that carry the keypad
+  # user slot. Combined with Keymaster's named code slots, you get
+  # "Cleaner unlocked the front door" instead of just "door unlocked".
+  - alias: "Security: door unlocked — identify who and how"
+    id: sec_lock_who_unlocked
+    mode: queued
+    triggers:
+      - trigger: event
+        event_type: zwave_js_notification
+        event_data:
+          command_class: 113          # Notification CC
+          type: 6                     # Access Control
+    actions:
+      - variables:
+          # Access Control event codes: 2 = manual unlock, 4 = RF/app unlock,
+          # 6 = keypad unlock, 9 = auto-relock, 11 = jammed
+          evt: "{{ trigger.event.data.event }}"
+          slot: "{{ trigger.event.data.parameters.userId | default('') }}"
+          code_names:
+            "1": "You"                # TODO: match your Keymaster slot names
+            "2": "Partner"
+            "3": "Cleaner"
+            "4": "Guest"
+      - choose:
+          - conditions: "{{ evt == 6 }}"
+            sequence:
+              - action: notify.notify
+                data:
+                  title: "🔓 Keypad unlock"
+                  message: >
+                    {{ code_names.get(slot | string, 'Slot ' ~ slot) }} unlocked
+                    {{ device_attr(trigger.event.data.device_id, 'name') }}.
+          - conditions: "{{ evt == 11 }}"
+            sequence:
+              - action: notify.notify
+                data:
+                  title: "⚠️ Lock jammed"
+                  message: >
+                    {{ device_attr(trigger.event.data.device_id, 'name') }} failed
+                    to lock — the bolt is jammed. The door may be unsecured.
+                  data:
+                    push:
+                      sound:
+                        name: default
+                        critical: 1
+                        volume: 1.0
+
+  # Service codes (cleaner, dog walker) should only work when you expect
+  # them. Disable the slot outside business hours via Keymaster's toggle.
+  - alias: "Security: service codes valid business hours only"
+    id: sec_service_code_schedule
+    mode: single
+    triggers:
+      - trigger: time
+        at: "08:00:00"
+        id: enable
+      - trigger: time
+        at: "18:00:00"
+        id: disable
+    actions:
+      - if:
+          - condition: trigger
+            id: enable
+        then:
+          - action: input_boolean.turn_on
+            target:
+              entity_id: input_boolean.frontdoor_enabled_3   # TODO: Keymaster slot-enable toggle
+        else:
+          - action: input_boolean.turn_off
+            target:
+              entity_id: input_boolean.frontdoor_enabled_3
+
+  # -------------------- Bed as an intrusion sensor --------------------
+  # SleepIQ pressure sensing works even for someone who avoided every
+  # motion sensor. Bed becomes occupied while the house is in away mode
+  # → someone is inside. Very few false positives (a pet, at worst).
+  - alias: "Security: bed occupied while everyone is away"
+    id: sec_bed_occupied_away
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id:
+          - binary_sensor.sleepiq_bed_left_occupied     # TODO: bed occupancy sensors
+          - binary_sensor.sleepiq_bed_right_occupied
+        to: "on"
+        for: "00:02:00"
+    conditions:
+      - condition: numeric_state
+        entity_id: zone.home
+        below: 1
+      - condition: state
+        entity_id: input_boolean.guest_mode
+        state: "off"
+    actions:
+      - action: notify.notify
+        data:
+          title: "🚨 Bed occupied while away"
+          message: >
+            {{ trigger.to_state.name }} reports someone in bed, but nobody is
+            supposed to be home. Check cameras.
+          data:
+            push:
+              sound:
+                name: default
+                critical: 1
+                volume: 1.0
+            entity_id: camera.unifiprotect_front       # TODO: a camera entity
+
+  # -------------------- Asleep-aware alerting --------------------
+  # Person detected outside at night *while you're in bed*: a phone push
+  # won't wake you. Flash the bedroom light red instead — silent for the
+  # neighborhood, unmissable for you.
+  - alias: "Security: night person detection — flash bedroom light"
+    id: sec_night_person_flash
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.unifiprotect_back_person   # TODO: Protect smart-detect person sensor
+        to: "on"
+    conditions:
+      - condition: time
+        after: "23:00:00"
+        before: "05:00:00"
+      - condition: state
+        entity_id: binary_sensor.sleepiq_bed_left_occupied
+        state: "on"
+    actions:
+      - action: scene.create
+        data:
+          scene_id: before_security_flash
+          snapshot_entities: light.bedroom             # TODO: bedroom light
+      - repeat:
+          count: 3
+          sequence:
+            - action: light.turn_on
+              target:
+                entity_id: light.bedroom
+              data:
+                rgb_color: [255, 0, 0]
+                brightness_pct: 100
+            - delay: "00:00:01"
+            - action: light.turn_off
+              target:
+                entity_id: light.bedroom
+            - delay: "00:00:01"
+      - action: scene.turn_on
+        target:
+          entity_id: scene.before_security_flash
+      - action: notify.notify
+        data:
+          title: "👤 Person in the backyard"
+          message: "Smart detection at {{ trigger.to_state.name }}."
+          data:
+            entity_id: camera.unifiprotect_back        # TODO: matching camera
+
+  # -------------------- Elk M1: prop-open escalation --------------------
+  # A door held open is a security *and* HVAC problem. Escalate: chime at
+  # 5 minutes, push at 10, announce every 10 after that until closed.
+  - alias: "Security: door propped open — escalating alerts"
+    id: sec_door_prop_escalation
+    mode: restart
+    triggers:
+      - trigger: state
+        entity_id:
+          - binary_sensor.elk_back_door         # TODO: Elk M1 door sensors
+          - binary_sensor.elk_side_door
+        to: "on"
+        for: "00:05:00"
+    actions:
+      - action: script.announce
+        data:
+          message: "{{ trigger.to_state.name }} has been open for five minutes."
+      - wait_for_trigger:
+          - trigger: state
+            entity_id: "{{ trigger.entity_id }}"
+            to: "off"
+        timeout: "00:05:00"
+      - if:
+          - condition: template
+            value_template: "{{ not wait.completed }}"
+        then:
+          - repeat:
+              until:
+                - condition: template
+                  value_template: "{{ is_state(trigger.entity_id, 'off') }}"
+              sequence:
+                - action: notify.notify
+                  data:
+                    title: "🚪 Door still open"
+                    message: "{{ trigger.to_state.name }} is still open."
+                - wait_for_trigger:
+                    - trigger: state
+                      entity_id: "{{ trigger.entity_id }}"
+                      to: "off"
+                  timeout: "00:10:00"
+
+  # Entry chime: any Elk perimeter opening while home makes a soft
+  # announcement — you always know when a door opens, no panel needed.
+  - alias: "Security: entry chime while home"
+    id: sec_entry_chime
+    mode: queued
+    max: 3
+    triggers:
+      - trigger: state
+        entity_id:
+          - binary_sensor.elk_front_door
+          - binary_sensor.elk_back_door
+          - binary_sensor.elk_garage_entry
+        to: "on"
+    conditions:
+      - condition: numeric_state
+        entity_id: zone.home
+        above: 0
+      - condition: state
+        entity_id: input_boolean.quiet_hours
+        state: "off"
+    actions:
+      - action: script.announce
+        data:
+          message: "{{ trigger.to_state.name | replace('_', ' ') }} opened."
+
+  # -------------------- Environmental security --------------------
+  # WeatherFlow's distance sensor is a *lightning strike* distance.
+  # A close strike: close the garage (surge-prone opener), nudge you to
+  # unplug sensitive gear, and pre-position for a power blip.
+  - alias: "Security: lightning strike nearby"
+    id: sec_lightning_close
+    mode: single
+    triggers:
+      - trigger: numeric_state
+        entity_id: sensor.weatherflow_lightning_distance   # TODO: WeatherFlow strike distance
+        below: 10
+    conditions:
+      - condition: template
+        value_template: >
+          {{ state_attr(this.entity_id, 'last_triggered') is none or
+             (now() - state_attr(this.entity_id, 'last_triggered')).total_seconds() > 1800 }}
+    actions:
+      - action: notify.notify
+        data:
+          title: "⛈️ Lightning within 10 km"
+          message: >
+            Strike detected {{ states('sensor.weatherflow_lightning_distance') }} km away.
+            Garage is being closed; consider unplugging sensitive electronics.
+      - if:
+          - condition: state
+            entity_id: cover.esphome_garage_door
+            state: "open"
+        then:
+          - action: cover.close_cover
+            target:
+              entity_id: cover.esphome_garage_door
+
+  # Moon-aware exterior lighting: skip landscape/security floods on bright
+  # full-moon nights — the cameras see fine and the yard doesn't glow.
+  - alias: "Security: exterior lights adapt to moon phase"
+    id: sec_moon_exterior_lights
+    mode: single
+    triggers:
+      - trigger: sun
+        event: sunset
+        offset: "00:20:00"
+    actions:
+      - if:
+          - condition: state
+            entity_id: sensor.moon_phase
+            state: "full_moon"
+        then:
+          - action: light.turn_on
+            target:
+              entity_id: light.landscape          # TODO: exterior lights
+            data:
+              brightness_pct: 30
+        else:
+          - action: light.turn_on
+            target:
+              entity_id: light.landscape
+            data:
+              brightness_pct: 80

@@ -1,0 +1,263 @@
+# ------------------------------------------------------------------
+# device_events.yaml — power signatures, TV overlays, tablet presence,
+# device watchdogs, and one fun Habitica trick
+# Integrations: Emporia Vue, Powercalc, Pipup, Browser Mod, Habitica,
+#               UniFi Protect (event entity), Hassio, Z-Wave JS,
+#               Govee BLE / SwitchBot (timestamp freshness)
+# ------------------------------------------------------------------
+
+# -------------------- Power-signature sensing --------------------
+# An Emporia circuit is a free "appliance done" sensor: watch the power
+# curve instead of adding hardware. Template binary sensors debounce the
+# draw so mid-cycle dips don't fire false "done" events.
+template:
+  - binary_sensor:
+      # TODO: point at your Emporia washer circuit
+      - name: "Washer running"
+        delay_on: "00:01:00"      # ignore the door-lock blip
+        delay_off: "00:03:00"     # ride through mid-cycle pauses
+        state: >
+          {{ states('sensor.emporia_vue_washer_power') | float(0) > 10 }}
+
+      - name: "Dryer running"
+        delay_on: "00:01:00"
+        delay_off: "00:03:00"
+        state: >
+          {{ states('sensor.emporia_vue_dryer_power') | float(0) > 100 }}
+
+      # High-wattage resistive load left on = fire risk (iron, space
+      # heater, curling iron on a monitored outlet).
+      # TODO: point at the monitored outlet circuit
+      - name: "Heat appliance left on"
+        delay_on: "00:45:00"
+        state: >
+          {{ states('sensor.emporia_vue_bathroom_outlet_power') | float(0) > 300 }}
+
+automation:
+  - alias: "Devices: laundry done"
+    id: dev_laundry_done
+    mode: queued
+    triggers:
+      - trigger: state
+        entity_id:
+          - binary_sensor.washer_running
+          - binary_sensor.dryer_running
+        from: "on"
+        to: "off"
+    actions:
+      - variables:
+          appliance: "{{ 'Washer' if 'washer' in trigger.entity_id else 'Dryer' }}"
+      - action: notify.notify
+        data:
+          title: "🧺 {{ appliance }} finished"
+          message: "The {{ appliance | lower }} cycle is done."
+      - action: script.announce
+        data:
+          message: "The {{ appliance | lower }} is finished."
+      # Nag again in 30 min if the dryer wasn't opened (door sensor optional):
+      # add a wait_for_trigger on a door sensor here if you have one.
+
+  - alias: "Devices: heat appliance left on — kill the outlet"
+    id: dev_heat_appliance_off
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.heat_appliance_left_on
+        to: "on"
+    actions:
+      - action: notify.notify
+        data:
+          title: "🔥 Something hot left on"
+          message: >
+            A heating appliance has drawn power for 45 minutes.
+            Turning the outlet off in 5 minutes unless you cancel.
+          data:
+            actions:
+              - action: "KEEP_OUTLET_ON"
+                title: "Keep it on"
+      - wait_for_trigger:
+          - trigger: event
+            event_type: mobile_app_notification_action
+            event_data:
+              action: "KEEP_OUTLET_ON"
+        timeout: "00:05:00"
+      - if:
+          - condition: template
+            value_template: "{{ not wait.completed }}"
+        then:
+          - action: switch.turn_off
+            target:
+              entity_id: switch.emporia_vue_bathroom_outlet   # TODO: Emporia smart outlet
+
+  # -------------------- Pipup: overlays on the TV --------------------
+  # Pipup draws a picture-in-picture popup on Android TV *without pausing
+  # what's playing* — far less disruptive than casting a camera feed.
+  - alias: "Devices: doorbell popup on TV"
+    id: dev_pipup_doorbell
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.unifiprotect_doorbell_person   # TODO: Protect person sensor
+        to: "on"
+    conditions:
+      - condition: state
+        entity_id: media_player.androidtv_living_room           # TODO: Android TV media player
+        state: "playing"
+      - condition: state
+        entity_id: binary_sensor.pipup_connectivity             # TODO: Pipup connectivity sensor
+        state: "on"
+    actions:
+      - action: rest_command.pipup_camera_popup
+        data:
+          title: "Front door"
+          message: "Person detected"
+
+  # -------------------- Browser Mod: wall tablet as a sensor --------------------
+  # Browser Mod's motion sensor reports interaction with the wall tablet.
+  # Use it two ways: wake the dashboard when someone walks up (paired with
+  # a nearby motion sensor), and treat tablet interaction as room presence.
+  - alias: "Devices: wake wall tablet on approach"
+    id: dev_tablet_wake
+    mode: restart
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.esphome_hallway_motion    # TODO: motion near the tablet
+        to: "on"
+    actions:
+      - action: browser_mod.screen_on
+        data:
+          browser_id: wall_tablet                          # TODO: your Browser Mod browser_id
+      - wait_for_trigger:
+          - trigger: state
+            entity_id:
+              - binary_sensor.esphome_hallway_motion
+              - binary_sensor.wall_tablet_motion           # TODO: Browser Mod motion sensor
+            to: "off"
+            for: "00:02:00"
+        timeout: "00:15:00"
+      - action: browser_mod.screen_off
+        data:
+          browser_id: wall_tablet
+
+  # -------------------- Device watchdogs --------------------
+  # BLE sensors (Govee, SwitchBot, Mopeka) die silently — HA keeps the
+  # last reading forever. A daily freshness sweep catches dead batteries
+  # and out-of-range devices that no other alert will.
+  - alias: "Devices: BLE sensors gone silent"
+    id: dev_ble_watchdog
+    mode: single
+    triggers:
+      - trigger: time
+        at: "19:00:00"
+    conditions:
+      - condition: template
+        value_template: >
+          {{ expand(['sensor.govee_fridge_temperature',
+                     'sensor.switchbot_meter_temperature',
+                     'sensor.mopeka_tank_level'])
+             | selectattr('last_updated', 'lt', now() - timedelta(hours=3))
+             | list | count > 0 }}
+    actions:
+      # TODO: keep this list in sync with the condition above
+      - action: notify.notify
+        data:
+          title: "📡 BLE sensors gone quiet"
+          message: >
+            {% for s in expand(['sensor.govee_fridge_temperature',
+                                'sensor.switchbot_meter_temperature',
+                                'sensor.mopeka_tank_level'])
+               if s.last_updated < now() - timedelta(hours=3) %}
+            • {{ s.name }} (last seen {{ relative_time(s.last_updated) }} ago)
+            {% endfor %}
+
+  # Z-Wave battery devices check in on a schedule; a node that goes "dead"
+  # takes your door/motion coverage with it.
+  - alias: "Devices: Z-Wave node dead"
+    id: dev_zwave_dead
+    mode: queued
+    triggers:
+      - trigger: state
+        entity_id:
+          - binary_sensor.zwave_front_door_sensor    # TODO: any critical Z-Wave sensors
+          - binary_sensor.zwave_motion_hall
+        to: "unavailable"
+        for: "01:00:00"
+    actions:
+      - action: notify.notify
+        data:
+          title: "💀 Z-Wave device unresponsive"
+          message: >
+            {{ trigger.to_state.name }} has been unavailable for an hour —
+            battery dead or node dropped. Security coverage is reduced.
+
+  # HA itself restarted — know about it, and re-assert helper states that
+  # automations depend on (latches can be lost on an unclean shutdown).
+  - alias: "Devices: Home Assistant restarted"
+    id: dev_ha_restarted
+    mode: single
+    triggers:
+      - trigger: homeassistant
+        event: start
+    actions:
+      - action: notify.notify
+        data:
+          message: "🔄 Home Assistant restarted at {{ now().strftime('%H:%M') }}."
+      # Re-derive quiet hours from the actual time instead of trusting the latch.
+      - if:
+          - condition: time
+            after: "22:00:00"
+            before: "07:00:00"
+        then:
+          - action: input_boolean.turn_on
+            target:
+              entity_id: input_boolean.quiet_hours
+        else:
+          - action: input_boolean.turn_off
+            target:
+              entity_id: input_boolean.quiet_hours
+
+  # -------------------- Habitica: real-world task completion --------------------
+  # Close the loop between the house and your habit tracker: when the bed
+  # is vacated and then motion stops in the bedroom on a weekday morning,
+  # score the "Make the bed" daily automatically.
+  - alias: "Devices: auto-complete Habitica daily via house state"
+    id: dev_habitica_bed
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.sleepiq_bed_left_occupied
+        from: "on"
+        to: "off"
+        for: "00:30:00"
+    conditions:
+      - condition: time
+        after: "06:00:00"
+        before: "10:00:00"
+        weekday: [mon, tue, wed, thu, fri]
+    actions:
+      - action: habitica.update_task
+        data:
+          config_entry: YOUR_HABITICA_CONFIG_ENTRY_ID   # TODO: from the Habitica integration
+          task: "Make the bed"                          # TODO: exact daily name
+          # If update_task scoring isn't available in your HA version, use
+          # the habitica.api_call action to score the task instead.
+
+# Pipup needs a REST command pointing at the TV. Adjust IP + camera URL.
+rest_command:
+  pipup_camera_popup:
+    url: "http://192.168.1.50:7979/notify"     # TODO: Android TV IP running Pipup
+    method: post
+    content_type: "application/json"
+    payload: >
+      {
+        "duration": 12,
+        "position": 0,
+        "title": "{{ title }}",
+        "message": "{{ message }}",
+        "media": {
+          "image": {
+            "uri": "http://YOUR_HA_IP:8123{{ state_attr('camera.unifiprotect_doorbell', 'entity_picture') }}",
+            "width": 480
+          }
+        }
+      }

@@ -1,0 +1,568 @@
+# ------------------------------------------------------------------
+# cross_integration.yaml — automations that only work because several
+# integrations cover for each other's blind spots.
+#
+# Integrations crossed here: WeatherFlow, Davis Vantage, Airthings,
+# Govee BLE, Emporia Vue, Powercalc, SolarEdge, Forecast Solar, Shelly,
+# Phyn, SleepIQ, SwitchBot, Z-Wave JS, ESPHome, Group, Keymaster,
+# UniFi, UniFi Protect, System Monitor, Uptime Kuma, Cloud, Bermuda,
+# Cast, Moon, Sun, Waze, Mobile App, Backup, Hassio, Monarch Money,
+# Utility Meter, Habitica
+# ------------------------------------------------------------------
+
+automation:
+  # 1 ---- Storm prep (WeatherFlow pressure + wind → covers, garage) ----
+  # A fast barometric drop plus rising wind is a squall arriving. Secure
+  # the house before the weather app even sends its alert.
+  - alias: "Cross: storm front — secure the house"
+    id: cross_storm_prep
+    mode: single
+    triggers:
+      # TODO: WeatherFlow pressure-trend sensor; or build a derivative
+      # sensor from sensor.weatherflow_pressure (statistics/derivative)
+      - trigger: template
+        value_template: >
+          {{ (states('sensor.weatherflow_pressure_trend') | float(0)) < -2 }}
+      - trigger: numeric_state
+        entity_id: sensor.weatherflow_wind_gust        # TODO: wind gust sensor
+        above: 35
+    conditions:
+      - condition: template
+        value_template: >
+          {{ state_attr(this.entity_id, 'last_triggered') is none or
+             (now() - state_attr(this.entity_id, 'last_triggered')).total_seconds() > 7200 }}
+    actions:
+      - action: cover.close_cover
+        target:
+          entity_id:
+            - cover.switchbot_living_room_curtain
+            - cover.zwave_office_shade
+      - if:
+          - condition: state
+            entity_id: cover.esphome_garage_door
+            state: "open"
+        then:
+          - action: cover.close_cover
+            target:
+              entity_id: cover.esphome_garage_door
+      - action: notify.notify
+        data:
+          title: "⛈️ Storm front approaching"
+          message: >
+            Pressure dropping fast, gusts
+            {{ states('sensor.weatherflow_wind_gust') }}. Covers and garage
+            secured. Bring in anything loose outside.
+
+  # 2 ---- Rain starting + windows open (Davis + Group) ----
+  # The rain gauge knows before you do; the window group knows what's
+  # exposed. Announce inside AND push, because whoever is home can act.
+  - alias: "Cross: rain starting with windows open"
+    id: cross_rain_windows_open
+    mode: single
+    triggers:
+      - trigger: numeric_state
+        entity_id: sensor.davis_vantage_rain_rate      # TODO: Davis precipitation-intensity
+        above: 0
+    conditions:
+      - condition: state
+        entity_id: binary_sensor.all_windows           # Group window group
+        state: "on"
+    actions:
+      - action: script.announce
+        data:
+          message: >
+            It's starting to rain and windows are open:
+            {{ expand('binary_sensor.all_windows')
+               | selectattr('state', 'eq', 'on') | map(attribute='name') | join(', ') }}.
+      - action: notify.notify
+        data:
+          title: "🌧️ Rain + open windows"
+          message: >
+            Open: {{ expand('binary_sensor.all_windows')
+              | selectattr('state', 'eq', 'on') | map(attribute='name') | join(', ') }}
+
+  # 3 ---- Outdoor air quality vs open windows (Airthings + Group) ----
+  # Indoor PM2.5 climbing while windows are open means the problem is
+  # outside (wildfire smoke, dust). Close up and let the HVAC filter.
+  - alias: "Cross: smoke/dust coming in through windows"
+    id: cross_pm25_windows
+    mode: single
+    triggers:
+      - trigger: numeric_state
+        entity_id: sensor.airthings_pm25
+        above: 35
+        for: "00:15:00"
+    conditions:
+      - condition: state
+        entity_id: binary_sensor.all_windows
+        state: "on"
+    actions:
+      - action: script.announce
+        data:
+          message: >
+            Fine-particle levels are rising indoors and windows are open.
+            Consider closing them.
+      - action: notify.notify
+        data:
+          title: "🏭 PM2.5 rising with windows open"
+          message: >
+            Indoor PM2.5 is {{ states('sensor.airthings_pm25') }} µg/m³.
+            Outdoor air is likely the source — close windows and run the fan.
+
+  # 4 ---- "Open the windows" advisory (WeatherFlow + Airthings + Emporia) ----
+  # The reverse: perfect outside, stuffy inside, HVAC burning watts.
+  # Trifecta says open up and give the compressor a rest.
+  - alias: "Cross: perfect weather — open windows, rest the HVAC"
+    id: cross_open_windows_advice
+    mode: single
+    triggers:
+      - trigger: time_pattern
+        hours: "/1"
+    conditions:
+      - condition: numeric_state
+        entity_id: sensor.weatherflow_air_temperature
+        above: 62
+        below: 76
+      - condition: numeric_state
+        entity_id: sensor.weatherflow_relative_humidity   # TODO: outdoor humidity
+        below: 65
+      - condition: numeric_state
+        entity_id: sensor.airthings_co2
+        above: 800
+      - condition: numeric_state
+        entity_id: sensor.emporia_vue_hvac_power          # TODO: HVAC circuit
+        above: 500
+      - condition: state
+        entity_id: binary_sensor.all_windows
+        state: "off"
+      - condition: numeric_state
+        entity_id: zone.home
+        above: 0
+      # Once per day is plenty for advice.
+      - condition: template
+        value_template: >
+          {{ state_attr(this.entity_id, 'last_triggered') is none or
+             state_attr(this.entity_id, 'last_triggered').date() != now().date() }}
+    actions:
+      - action: notify.notify
+        data:
+          title: "🪟 Open-window weather"
+          message: >
+            {{ states('sensor.weatherflow_air_temperature') }}° and dry outside,
+            CO2 {{ states('sensor.airthings_co2') }} ppm inside, and the HVAC is
+            drawing {{ states('sensor.emporia_vue_hvac_power') }} W. Open up.
+
+  # 5 ---- Shower steam → bath fan (Govee humidity + Emporia switch) ----
+  # Humidity spike in the bathroom runs the fan outlet until it clears.
+  - alias: "Cross: bathroom humidity spike — run fan until clear"
+    id: cross_shower_fan
+    mode: restart
+    triggers:
+      - trigger: numeric_state
+        entity_id: sensor.govee_bathroom_humidity      # TODO: bathroom humidity sensor
+        above: 70
+    actions:
+      - action: switch.turn_on
+        target:
+          entity_id: switch.emporia_vue_bath_fan        # TODO: fan on a smart outlet
+      - wait_for_trigger:
+          - trigger: numeric_state
+            entity_id: sensor.govee_bathroom_humidity
+            below: 58
+            for: "00:05:00"
+        timeout: "01:00:00"
+      - action: switch.turn_off
+        target:
+          entity_id: switch.emporia_vue_bath_fan
+
+  # 6 ---- Guest mode orchestration (Keymaster + UniFi + locks) ----
+  # One toggle configures the whole house for guests: guest Wi-Fi on,
+  # guest door code enabled, auto-lock and lockdown automations already
+  # check this boolean.
+  - alias: "Cross: guest mode on/off orchestration"
+    id: cross_guest_mode
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: input_boolean.guest_mode
+        to: ["on", "off"]
+    actions:
+      - if:
+          - condition: state
+            entity_id: input_boolean.guest_mode
+            state: "on"
+        then:
+          - action: switch.turn_on
+            target:
+              entity_id: switch.unifi_guest_wifi        # TODO: UniFi WLAN switch
+          - action: input_boolean.turn_on
+            target:
+              entity_id: input_boolean.frontdoor_enabled_4   # TODO: Keymaster guest slot
+          - action: notify.notify
+            data:
+              message: "🛎️ Guest mode ON: guest Wi-Fi live, guest door code active."
+        else:
+          - action: switch.turn_off
+            target:
+              entity_id: switch.unifi_guest_wifi
+          - action: input_boolean.turn_off
+            target:
+              entity_id: input_boolean.frontdoor_enabled_4
+          - action: notify.notify
+            data:
+              message: "🛎️ Guest mode OFF: guest Wi-Fi and door code disabled."
+
+  # 7 ---- Vacation water shutoff (vacation mode + Phyn + Proximity) ----
+  # The highest-value vacation automation there is: no water pressure in
+  # the pipes while you're gone, restored before you walk in.
+  - alias: "Cross: vacation mode — shut water main"
+    id: cross_vacation_water_off
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: input_boolean.vacation_mode
+        to: "on"
+        for: "01:00:00"
+    actions:
+      - action: valve.close_valve
+        target:
+          entity_id: valve.phyn_main_water
+      - action: notify.notify
+        data:
+          message: "🧳 Vacation mode: main water valve closed."
+
+  - alias: "Cross: returning from vacation — restore water"
+    id: cross_vacation_water_on
+    mode: single
+    triggers:
+      - trigger: numeric_state
+        entity_id: sensor.home_nearest_distance         # Proximity: almost home
+        below: 5
+      - trigger: state
+        entity_id: input_boolean.vacation_mode
+        to: "off"
+    conditions:
+      - condition: or
+        conditions:
+          - condition: state
+            entity_id: input_boolean.vacation_mode
+            state: "on"
+          - condition: template
+            value_template: "{{ trigger.entity_id == 'input_boolean.vacation_mode' }}"
+    actions:
+      - action: valve.open_valve
+        target:
+          entity_id: valve.phyn_main_water
+      - action: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.vacation_mode
+      - action: notify.notify
+        data:
+          message: "🏠 Welcome back — water main reopened."
+
+  # 8 ---- Backup before installing updates (Backup + update entities) ----
+  # A script, not an automation: pick an update entity, and it snapshots
+  # first, waits for the backup to finish, then installs.
+  # 9 ---- (script below) ----
+
+  # 10 ---- Rack/closet heat (UniFi + System Monitor + UniFi Protect + Emporia) ----
+  # Your network gear reports temperature from three different vendors.
+  # Any of them running hot → kick a cooling fan outlet and warn.
+  - alias: "Cross: equipment closet running hot"
+    id: cross_rack_heat
+    mode: single
+    triggers:
+      - trigger: numeric_state
+        entity_id:
+          - sensor.unifi_switch_temperature            # TODO: UniFi device temp
+          - sensor.system_monitor_processor_temperature
+          - sensor.unifiprotect_nvr_temperature        # TODO: NVR temp
+        above: 75    # °C for gear; adjust per sensor units
+        for: "00:10:00"
+    actions:
+      - action: switch.turn_on
+        target:
+          entity_id: switch.emporia_vue_closet_fan     # TODO: fan outlet
+      - action: notify.notify
+        data:
+          title: "🌡️ Equipment running hot"
+          message: >
+            {{ trigger.to_state.name }} is at {{ trigger.to_state.state }}°.
+            Closet fan turned on. Check for blocked airflow.
+      - wait_for_trigger:
+          - trigger: numeric_state
+            entity_id: "{{ trigger.entity_id }}"
+            below: 65
+            for: "00:10:00"
+        timeout: "02:00:00"
+      - action: switch.turn_off
+        target:
+          entity_id: switch.emporia_vue_closet_fan
+
+  # 11 ---- Grid voltage anomaly (Shelly + Emporia) ----
+  # Brownouts kill compressors and power supplies. Shelly reports mains
+  # voltage continuously — alert when it sags or surges.
+  - alias: "Cross: mains voltage out of range"
+    id: cross_voltage_anomaly
+    mode: single
+    triggers:
+      - trigger: numeric_state
+        entity_id: sensor.shelly_1_voltage              # TODO: a Shelly voltage sensor
+        below: 108
+        for: "00:02:00"
+        id: sag
+      - trigger: numeric_state
+        entity_id: sensor.shelly_1_voltage
+        above: 128
+        for: "00:02:00"
+        id: surge
+    actions:
+      - action: notify.notify
+        data:
+          title: "⚡ Grid voltage {{ 'sag' if trigger.id == 'sag' else 'surge' }}"
+          message: >
+            Mains at {{ states('sensor.shelly_1_voltage') }} V for 2+ minutes.
+            Whole-home draw: {{ states('sensor.emporia_vue_mains_power') }} W.
+            Consider shutting down sensitive equipment if it persists.
+
+  # 12 ---- Solar underperformance (SolarEdge + Forecast Solar + Sun) ----
+  # Actual production far below the forecast on what should be a good
+  # solar day = snow, shading, a tripped inverter, or a failed optimizer.
+  - alias: "Cross: solar producing far below forecast"
+    id: cross_solar_underperforming
+    mode: single
+    triggers:
+      - trigger: time
+        at: "13:00:00"
+    conditions:
+      - condition: sun
+        after: sunrise
+        before: sunset
+      - condition: numeric_state
+        entity_id: sensor.power_production_now          # TODO: Forecast Solar "now" estimate
+        above: 1500                                     # forecast says it should be sunny
+      - condition: template
+        value_template: >
+          {{ states('sensor.solaredge_current_power') | float(0) <
+             states('sensor.power_production_now') | float(0) * 0.4 }}
+    actions:
+      - action: notify.notify
+        data:
+          title: "🔆 Solar underperforming"
+          message: >
+            Producing {{ states('sensor.solaredge_current_power') }} W but the
+            forecast expected ~{{ states('sensor.power_production_now') }} W.
+            Check the inverter, panel shading, or snow cover.
+
+  # 13 ---- Music follows you (Bermuda + Cast) ----
+  # Walk to another room and your music comes with you. Requires speakers
+  # in the mapped rooms; moves playback rather than grouping.
+  - alias: "Cross: music follows you between rooms"
+    id: cross_music_follow
+    mode: queued
+    max: 3
+    triggers:
+      - trigger: state
+        entity_id: sensor.bermuda_your_phone_area
+    conditions:
+      - condition: template
+        value_template: "{{ trigger.to_state.state not in ['unknown', 'unavailable'] }}"
+    actions:
+      - variables:
+          area_speakers:
+            kitchen: media_player.kitchen_speaker       # TODO: map areas → Cast speakers
+            living_room: media_player.living_room_speaker
+            office: media_player.office_speaker
+          old_player: >
+            {{ area_speakers.get(trigger.from_state.state if trigger.from_state else '', '') }}
+          new_player: "{{ area_speakers.get(trigger.to_state.state, '') }}"
+      - condition: template
+        value_template: >
+          {{ old_player != '' and new_player != '' and old_player != new_player
+             and is_state(old_player, 'playing') }}
+      - action: media_player.play_media
+        target:
+          entity_id: "{{ new_player }}"
+        data:
+          media_content_id: "{{ state_attr(old_player, 'media_content_id') }}"
+          media_content_type: music
+      - delay: "00:00:03"
+      - action: media_player.media_stop
+        target:
+          entity_id: "{{ old_player }}"
+
+  # 14 ---- Sleep environment report (SleepIQ + Airthings + Govee) ----
+  # Morning digest tying how long you slept to the bedroom conditions
+  # overnight — the data you need to actually fix bad sleep.
+  - alias: "Cross: morning sleep environment report"
+    id: cross_sleep_report
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.sleepiq_bed_left_occupied
+        from: "on"
+        to: "off"
+        for: "00:20:00"
+    conditions:
+      - condition: time
+        after: "05:30:00"
+        before: "10:00:00"
+    actions:
+      - action: notify.notify
+        data:
+          title: "🛌 Last night"
+          message: >
+            Time in bed: {{ states('sensor.sleepiq_sleep_duration') }}.
+            Bedroom overnight — temp
+            {{ states('sensor.govee_bedroom_temperature') }}°, humidity
+            {{ states('sensor.govee_bedroom_humidity') }}%, CO2
+            {{ states('sensor.airthings_co2') }} ppm.
+            {% if states('sensor.airthings_co2') | float(0) > 900 %}
+            CO2 ran high — try cracking the door or a window tonight.
+            {% endif %}
+
+  # 15 ---- Blackout on bright moon (Moon + SwitchBot + SleepIQ) ----
+  # Full or near-full moon and someone gets in bed: make sure the
+  # blackout curtain is actually closed.
+  - alias: "Cross: full moon — verify blackout curtains"
+    id: cross_moon_blackout
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.sleepiq_bed_left_occupied
+        to: "on"
+        for: "00:05:00"
+    conditions:
+      - condition: state
+        entity_id: sensor.moon_phase
+        state:
+          - "full_moon"
+          - "waxing_gibbous"
+          - "waning_gibbous"
+    actions:
+      - action: cover.close_cover
+        target:
+          entity_id: cover.switchbot_bedroom_curtain    # TODO: bedroom blackout curtain
+
+  # 16 ---- Frost on the windshield (WeatherFlow + departure helper) ----
+  # Freezing overnight + a workday: nudge you 15 minutes before your
+  # normal departure so the defrost time is already budgeted.
+  - alias: "Cross: frost expected — leave time to defrost"
+    id: cross_frost_departure
+    mode: single
+    triggers:
+      - trigger: template
+        value_template: >
+          {{ (now().hour * 60 + now().minute) ==
+             (state_attr('input_datetime.workday_departure', 'hour') | int(8) * 60
+              + state_attr('input_datetime.workday_departure', 'minute') | int(0)
+              - 60) }}
+    conditions:
+      - condition: time
+        weekday: [mon, tue, wed, thu, fri]
+      - condition: numeric_state
+        entity_id: sensor.weatherflow_air_temperature
+        below: 34
+    actions:
+      - action: notify.notify
+        data:
+          title: "❄️ Frost this morning"
+          message: >
+            It's {{ states('sensor.weatherflow_air_temperature') }}° out —
+            budget a few extra minutes to defrost the car.
+
+  # 17 ---- Internet outage log + recovery (Cloud + Uptime Kuma + UniFi) ----
+  # When the cloud link drops AND Uptime Kuma agrees, it's a real outage,
+  # not an HA blip. Notify on recovery with the outage duration — pushes
+  # during the outage wouldn't arrive anyway.
+  - alias: "Cross: internet restored — report outage duration"
+    id: cross_internet_restored
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.cloud_remote_ui
+        from: "off"
+        to: "on"
+    conditions:
+      - condition: template
+        value_template: >
+          {{ trigger.from_state is not none and
+             (now() - trigger.from_state.last_changed).total_seconds() > 300 }}
+    actions:
+      - action: notify.notify
+        data:
+          title: "🌐 Internet restored"
+          message: >
+            Connectivity was down for
+            {{ relative_time(trigger.from_state.last_changed) }}.
+            If UniFi shows a WAN drop at the same time, it was the ISP.
+
+  # 18 ---- Month-end money + energy recap (Monarch + Utility Meter) ----
+  - alias: "Cross: month-end energy and finance recap"
+    id: cross_month_end_recap
+    mode: single
+    triggers:
+      - trigger: time
+        at: "20:00:00"
+    conditions:
+      - condition: template
+        value_template: "{{ (now() + timedelta(days=1)).day == 1 }}"   # last day of month
+    actions:
+      # TODO: point at your Monarch Money sensor and set your real utility rate
+      - action: notify.notify
+        data:
+          title: "📅 Month-end recap"
+          message: >
+            Energy this month: {{ states('sensor.monthly_energy') }} kWh
+            (≈ ${{ (states('sensor.monthly_energy') | float(0) * 0.15) | round(2) }}
+            at $0.15/kWh — adjust your rate).
+            Monarch net worth: {{ states('sensor.monarch_money_net_worth') }}.
+
+script:
+  # 8/9 ---- Safe update: snapshot, then install (Backup + update entities) ----
+  # Call with:  action: script.safe_update
+  #             data: { update_entity: update.esphome_garage_firmware }
+  safe_update:
+    alias: "Safe update (backup first)"
+    icon: mdi:shield-sync
+    fields:
+      update_entity:
+        description: "The update entity to install after backing up"
+        example: "update.esphome_garage_firmware"
+    sequence:
+      - action: backup.create
+      # Give the backup time to complete; the Backup integration's state
+      # flips while one is in progress.
+      - wait_template: >
+          {{ states('sensor.backup_backup_manager_state') == 'idle' }}
+        timeout: "00:20:00"
+      - action: update.install
+        target:
+          entity_id: "{{ update_entity }}"
+      - action: notify.notify
+        data:
+          message: >
+            🛡️ Backed up, then installed
+            {{ state_attr(update_entity, 'friendly_name') }}.
+
+  # Bonus ---- One-tap "Storm watch" (WeatherFlow + Habitica + covers) ----
+  # Run manually when weather looks threatening: secures the house and
+  # creates a Habitica to-do so the follow-ups (check gutters, tie down
+  # furniture) end up in your task list.
+  storm_watch:
+    alias: "Storm watch"
+    icon: mdi:weather-lightning-rainy
+    sequence:
+      - action: cover.close_cover
+        target:
+          entity_id:
+            - cover.switchbot_living_room_curtain
+            - cover.zwave_office_shade
+            - cover.esphome_garage_door
+      - action: habitica.create_todo
+        data:
+          config_entry: YOUR_HABITICA_CONFIG_ENTRY_ID   # TODO
+          name: "Storm follow-up: check gutters, patio furniture, sump pump"
+      - action: script.announce
+        data:
+          message: "Storm watch active. House is secured."

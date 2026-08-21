@@ -1,0 +1,217 @@
+# ------------------------------------------------------------------
+# advanced_tracking.yaml — room-level presence and "where are my things"
+# Integrations: Bermuda (BLE room tracking), iBeacon, UniFi (network),
+#               Mobile App, Proximity, Waze Travel Time, Cast
+#
+# Bermuda turns your ESPHome/Shelly BLE proxies into a room-level
+# indoor positioning system — the sensors report which *area* a
+# tracked BLE device (phone, watch, tag) is in. That unlocks
+# automations plain zone tracking can't do.
+# ------------------------------------------------------------------
+
+automation:
+  # Follow-me lighting: when your phone/watch moves to a room after dark,
+  # light that room; dim the one you left. Map areas to lights below.
+  - alias: "Tracking: follow-me lighting (Bermuda)"
+    id: track_follow_me_lights
+    mode: queued
+    max: 5
+    triggers:
+      - trigger: state
+        entity_id: sensor.bermuda_your_phone_area    # TODO: Bermuda area sensor
+    conditions:
+      - condition: sun
+        after: sunset
+        before: sunrise
+      - condition: template
+        value_template: "{{ trigger.to_state.state not in ['unknown', 'unavailable'] }}"
+    actions:
+      - variables:
+          area_lights:
+            kitchen: light.kitchen                   # TODO: map your areas → lights
+            living_room: light.living_room
+            office: light.office
+            bedroom: light.bedroom
+      - if:
+          - condition: template
+            value_template: "{{ trigger.to_state.state in area_lights }}"
+        then:
+          - action: light.turn_on
+            target:
+              entity_id: "{{ area_lights[trigger.to_state.state] }}"
+            data:
+              brightness_pct: 60
+      - if:
+          - condition: template
+            value_template: >
+              {{ trigger.from_state is not none
+                 and trigger.from_state.state in area_lights
+                 and trigger.from_state.state != trigger.to_state.state }}
+        then:
+          - delay: "00:02:00"
+          # Only dim the old room if nobody's tracked there anymore.
+          - if:
+              - condition: template
+                value_template: >
+                  {{ states('sensor.bermuda_your_phone_area') != trigger.from_state.state
+                     and states('sensor.bermuda_partner_phone_area') != trigger.from_state.state }}
+            then:
+              - action: light.turn_off
+                target:
+                  entity_id: "{{ area_lights[trigger.from_state.state] }}"
+
+  # Left-behind detection: you leave the house zone but the BLE tag on your
+  # keys/wallet/backpack is still detected at home → immediate alert while
+  # you're still close enough to turn around.
+  - alias: "Tracking: left keys/wallet behind"
+    id: track_left_item_behind
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: person.you                        # TODO: your person entity
+        from: "home"
+        to: "not_home"
+    conditions:
+      - condition: template
+        value_template: >
+          {{ states('sensor.bermuda_keys_area') not in ['unknown', 'unavailable', 'not_home'] }}
+          # TODO: Bermuda/iBeacon area sensor for the tag on your keys
+    actions:
+      - action: notify.notify
+        data:
+          title: "🔑 Keys still at home"
+          message: >
+            You just left, but your keys are still in
+            {{ states('sensor.bermuda_keys_area') }}.
+          data:
+            push:
+              sound:
+                name: default
+                critical: 1
+                volume: 0.8
+
+  # Phone-left-at-home is the inverse: your car/watch left but the phone
+  # beacon is still home. Announce it on the nearest speaker too, since
+  # a push notification to the phone you left behind is useless.
+  - alias: "Tracking: phone left at home"
+    id: track_phone_left_home
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: device_tracker.your_car           # TODO: any secondary tracker (car, watch)
+        from: "home"
+        to: "not_home"
+    conditions:
+      - condition: template
+        value_template: >
+          {{ states('sensor.bermuda_your_phone_area') not in ['unknown', 'unavailable', 'not_home'] }}
+    actions:
+      - action: notify.mobile_app_partner_phone      # TODO: someone else's phone
+        data:
+          message: "📱 Heads up — a phone was left at home in {{ states('sensor.bermuda_your_phone_area') }}."
+
+  # iBeacon distance as a driveway sensor: a beacon in the car crossing
+  # below ~10 m of the house means the car just arrived — open the garage
+  # before anyone touches a button. Guarded by direction-of-travel so it
+  # doesn't fire when the car *leaves*.
+  - alias: "Tracking: car arriving — open garage"
+    id: track_car_arrive_garage
+    mode: single
+    triggers:
+      - trigger: numeric_state
+        entity_id: sensor.ibeacon_car_distance       # TODO: iBeacon distance sensor
+        below: 10
+    conditions:
+      - condition: state
+        entity_id: sensor.home_nearest_direction_of_travel   # TODO: Proximity direction
+        state: "towards"
+      - condition: state
+        entity_id: cover.esphome_garage_door
+        state: "closed"
+      # Cooldown: don't re-open within 10 minutes of the last run.
+      - condition: template
+        value_template: >
+          {{ state_attr(this.entity_id, 'last_triggered') is none or
+             (now() - state_attr(this.entity_id, 'last_triggered')).total_seconds() > 600 }}
+    actions:
+      - action: cover.open_cover
+        target:
+          entity_id: cover.esphome_garage_door
+      - action: notify.notify
+        data:
+          message: "🚗 Welcome back — garage opening."
+
+  # UniFi knows every client on the network. A NEW device appearing on the
+  # LAN that HA has never seen is worth a look — a guest, or something else.
+  - alias: "Tracking: unknown device joined the network"
+    id: track_new_network_device
+    mode: queued
+    triggers:
+      - trigger: event
+        event_type: entity_registry_updated
+        event_data:
+          action: create
+    conditions:
+      - condition: template
+        value_template: >
+          {{ trigger.event.data.entity_id.startswith('device_tracker.') }}
+    actions:
+      - action: notify.notify
+        data:
+          title: "📶 New device on the network"
+          message: >
+            A new network client just appeared:
+            {{ trigger.event.data.entity_id }}. If you don't recognize it,
+            check the UniFi console.
+
+  # Tracker health: if the Mobile App stops reporting (background app killed,
+  # battery saver), presence automations silently degrade. Watch for it.
+  - alias: "Tracking: phone stopped reporting"
+    id: track_stale_mobile_app
+    mode: single
+    triggers:
+      - trigger: time_pattern
+        hours: "/2"
+    conditions:
+      # TODO: point at your Mobile App last-update-trigger sensor
+      - condition: template
+        value_template: >
+          {{ (now() - states.sensor.your_phone_last_update_trigger.last_updated)
+             .total_seconds() > 21600 }}
+      # Alert at most once every 12 hours.
+      - condition: template
+        value_template: >
+          {{ state_attr(this.entity_id, 'last_triggered') is none or
+             (now() - state_attr(this.entity_id, 'last_triggered')).total_seconds() > 43200 }}
+    actions:
+      - action: notify.notify
+        data:
+          title: "🛰️ Presence tracking degraded"
+          message: >
+            Your phone hasn't sent a location/sensor update in 6+ hours.
+            Open the Companion app to wake it up.
+
+  # ETA sharing: when one person starts heading home, tell whoever is
+  # already there, with a live Waze estimate.
+  - alias: "Tracking: heading home — share ETA"
+    id: track_share_eta
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: sensor.home_nearest_direction_of_travel
+        to: "towards"
+        for: "00:05:00"
+    conditions:
+      - condition: numeric_state
+        entity_id: sensor.home_nearest_distance
+        above: 3        # only when genuinely out, not around the corner
+      - condition: numeric_state
+        entity_id: zone.home
+        above: 0        # someone is home to care
+    actions:
+      # TODO: point at your home-bound Waze sensor
+      - action: script.announce
+        data:
+          message: >
+            Someone is heading home, about
+            {{ states('sensor.waze_travel_time_to_home') | round(0) }} minutes away.
