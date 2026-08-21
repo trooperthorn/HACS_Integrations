@@ -1,4 +1,6 @@
-# HACS Integrations Index
+# HACS Integrations Index - No clouds on this sunny day
+
+## Focus, end all Cloud connections, reverse engineer data via TCP/IP, Bluetooth, Serial, etc.
 
 A single landing page linking to every [Home Assistant](https://www.home-assistant.io/) custom integration maintained under this account. Use it to find and install any of them through [HACS](https://hacs.xyz/).
 
