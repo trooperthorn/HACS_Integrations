@@ -36,6 +36,11 @@ or removed independently.
 | `media.yaml` | Cast, Android TV Remote, Samsung TV, Yamaha YNCA, Monoprice, UniFi Protect | Movie-time script, whole-home announce script, auto-off for idle receivers |
 | `maintenance.yaml` | Backup, Google Drive, System Monitor, Uptime Kuma, Mobile App, ESPHome / Shelly / UniFi / Phyn / Z-Wave JS updates, Bermuda / Govee BLE | Low-battery digest, stale-backup alert, firmware update digest, disk-space warning, phone-battery reminder |
 | `commute.yaml` | Waze Travel Time, Mobile App | Leave-now notification when the commute is slow |
+| `advanced_tracking.yaml` | Bermuda, iBeacon, UniFi, Proximity, Mobile App, Waze | Room-level follow-me lighting, left-keys-behind and phone-left-home alerts, car-arrival garage open, new-network-device alert, stale-tracker watchdog, ETA sharing |
+| `advanced_security.yaml` | Z-Wave JS, Keymaster, Elk M1, SleepIQ, UniFi Protect, WeatherFlow, Moon | Named keypad-unlock notifications, lock-jam critical alert, scheduled service codes, bed-as-intrusion-sensor, asleep-aware light-flash alerts, door prop-open escalation, entry chime, lightning response, moon-phase exterior lighting |
+| `cross_integration.yaml` | Nearly all of them | 15+ multi-integration automations: storm prep, rain-vs-open-windows, smoke infiltration, open-window advisories, shower fan, guest-mode orchestration, vacation water shutoff, safe firmware updates (backup first), equipment-closet cooling, grid voltage anomalies, solar underperformance vs forecast, music that follows you, sleep environment reports, full-moon blackout curtains, frost departure warnings, outage recovery reports, month-end energy+finance recap |
+| `device_events.yaml` | Emporia Vue, Pipup, Browser Mod, Habitica, Z-Wave JS, Govee BLE, SwitchBot | Power-signature laundry-done and appliance-left-on detection with auto outlet cutoff, doorbell popups on Android TV via Pipup, wall-tablet wake/sleep, BLE and Z-Wave dead-device watchdogs, restart recovery, Habitica auto-scoring |
+
 
 ## Conventions used
 
